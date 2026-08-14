@@ -1,0 +1,542 @@
+-- ============================================================
+-- 新客短信后24H完整转化漏斗
+--
+-- 【短信发送日期】
+-- 2026-07-30 ~ 2026-08-13
+--
+-- 手机号规则：
+-- 7/30 ~ 8/4   ：直接使用 phone
+-- 8/5  ~ 8/11  ：phone需要解密
+-- 8/12 ~ 8/13  ：直接使用 phone
+--
+-- Plan：
+-- 3079 ~ 3128
+-- 排除：3081、3100、3105、3106
+--
+-- 每个用户观察窗口：
+-- first_send_time ~ first_send_time + 24H
+--
+-- 漏斗：
+-- SMS → OPT_IN → Apply → PASS → Eligible → Usage
+-- ============================================================
+
+WITH sms_raw AS (
+
+    /* ========================================================
+       1. 先标准化手机号
+
+       只有8/5~8/11需要解密
+       ======================================================== */
+
+    SELECT
+        DATE(r.send_time) AS send_date,
+
+        CASE
+            WHEN DATE(r.send_time)
+                 BETWEEN '2026-08-05' AND '2026-08-11'
+            THEN etl_data_normalize_decrypt_udf(r.phone)
+
+            ELSE r.phone
+        END AS phone,
+
+        r.send_time
+
+    FROM ug_analysis_dw_prod.ods_mtn_t_message_record_rt r
+
+    WHERE DATE(r.send_time)
+              BETWEEN '2026-07-30' AND '2026-08-13'
+
+      AND r.send_success = 1
+
+      AND r.plan_id BETWEEN 3079 AND 3128
+
+      AND r.plan_id NOT IN (
+          3081,
+          3100,
+          3105,
+          3106
+      )
+
+      AND r.phone IS NOT NULL
+),
+
+
+/* ============================================================
+   2. 每天每个手机号取第一次成功短信
+   ============================================================ */
+
+sms_user AS (
+
+    SELECT
+        send_date,
+        phone,
+
+        MIN(send_time) AS first_send_time
+
+    FROM sms_raw
+
+    WHERE phone IS NOT NULL
+
+    GROUP BY
+        send_date,
+        phone
+),
+
+
+/* ============================================================
+   3. 获取每个手机号首次进入Customer
+
+   b_customer.create_time
+   = OPT_IN / 注册时间
+   ============================================================ */
+
+customer_rank AS (
+
+    SELECT
+        id AS customer_id,
+        phone,
+        create_time,
+
+        ROW_NUMBER() OVER (
+            PARTITION BY phone
+            ORDER BY create_time, id
+        ) AS rn
+
+    FROM ug_analysis_dw_prod.ods_mtn_b_customer
+),
+
+
+customer_first AS (
+
+    SELECT
+        customer_id,
+        phone,
+        create_time AS optin_time
+
+    FROM customer_rank
+
+    WHERE rn = 1
+),
+
+
+/* ============================================================
+   4. 新客短信 Cohort
+
+   新客：
+   短信发送前尚未OPT_IN
+
+   观察窗口：
+   first_send_time ~ first_send_time + 24H
+   ============================================================ */
+
+new_sms_cohort AS (
+
+    SELECT
+        s.send_date,
+        s.phone,
+        s.first_send_time,
+
+        DATE_ADD(
+            s.first_send_time,
+            INTERVAL 24 HOUR
+        ) AS window_end_time,
+
+        c.customer_id,
+        c.optin_time
+
+    FROM sms_user s
+
+    LEFT JOIN customer_first c
+        ON s.phone = c.phone
+
+    WHERE c.optin_time IS NULL
+       OR c.optin_time >= s.first_send_time
+),
+
+
+/* ============================================================
+   5. SMS → OPT_IN
+
+   OPT_IN必须发生在短信后的24H以内
+   ============================================================ */
+
+optin_detail AS (
+
+    SELECT
+        send_date,
+        phone,
+        first_send_time,
+        window_end_time,
+        customer_id,
+        optin_time
+
+    FROM new_sms_cohort
+
+    WHERE optin_time >= first_send_time
+      AND optin_time < window_end_time
+),
+
+
+/* ============================================================
+   6. OPT_IN → Apply
+
+   Apply必须：
+   - 在OPT_IN之后
+   - 在短信后24H以内
+   ============================================================ */
+
+apply_detail AS (
+
+    SELECT
+        o.send_date,
+        o.phone,
+        o.first_send_time,
+        o.window_end_time,
+        o.customer_id,
+        o.optin_time,
+
+        a.overdraft_id,
+        a.create_time AS apply_time,
+        a.apply_result
+
+    FROM optin_detail o
+
+    JOIN ug_analysis_dw_prod.ods_mtn_b_credit_apply a
+
+        ON o.customer_id = a.customer_id
+
+       AND a.create_time >= o.optin_time
+
+       AND a.create_time < o.window_end_time
+),
+
+
+/* ============================================================
+   7. Apply → PASS
+   ============================================================ */
+
+pass_detail AS (
+
+    SELECT DISTINCT
+        send_date,
+        phone,
+        first_send_time,
+        window_end_time,
+        customer_id,
+        overdraft_id
+
+    FROM apply_detail
+
+    WHERE apply_result = 'PASS'
+),
+
+
+/* ============================================================
+   8. PASS → Eligible
+
+   Eligible：
+   overdraft_status = ACTIVE
+   total_quota_amount > 0
+
+   total_quota_amount = TCL
+   ============================================================ */
+
+eligible_detail AS (
+
+    SELECT DISTINCT
+        p.send_date,
+        p.phone,
+        p.first_send_time,
+        p.window_end_time,
+        p.customer_id,
+        p.overdraft_id,
+
+        q.total_quota_amount
+
+    FROM pass_detail p
+
+    JOIN ug_analysis_dw_prod.ods_mtn_b_customer_quota q
+
+        ON p.overdraft_id = q.overdraft_id
+
+       AND q.overdraft_status = 'ACTIVE'
+
+       AND q.total_quota_amount > 0
+),
+
+
+/* ============================================================
+   9. Eligible → Usage
+
+   USAGE必须：
+   - change_type = USAGE
+   - 在短信发送之后
+   - 在短信发送后24H以内
+   ============================================================ */
+
+usage_detail AS (
+
+    SELECT
+        e.send_date,
+        e.phone,
+        e.customer_id,
+        e.overdraft_id,
+
+        f.change_id,
+        f.change_time,
+        f.change_amount
+
+    FROM eligible_detail e
+
+    JOIN ug_analysis_dw_prod.ods_mtn_b_customer_quota_flow f
+
+        ON e.overdraft_id = f.overdraft_id
+
+       AND f.change_type = 'USAGE'
+
+       AND f.change_time >= e.first_send_time
+
+       AND f.change_time < e.window_end_time
+),
+
+
+/* ============================================================
+   10. SMS
+   ============================================================ */
+
+sms_agg AS (
+
+    SELECT
+        send_date,
+
+        COUNT(DISTINCT phone) AS sms_cnt
+
+    FROM new_sms_cohort
+
+    GROUP BY send_date
+),
+
+
+/* ============================================================
+   11. OPT_IN
+   ============================================================ */
+
+optin_agg AS (
+
+    SELECT
+        send_date,
+
+        COUNT(DISTINCT phone) AS optin_cnt
+
+    FROM optin_detail
+
+    GROUP BY send_date
+),
+
+
+/* ============================================================
+   12. Apply
+   ============================================================ */
+
+apply_agg AS (
+
+    SELECT
+        send_date,
+
+        COUNT(DISTINCT phone) AS apply_cnt
+
+    FROM apply_detail
+
+    GROUP BY send_date
+),
+
+
+/* ============================================================
+   13. PASS
+   ============================================================ */
+
+pass_agg AS (
+
+    SELECT
+        send_date,
+
+        COUNT(DISTINCT phone) AS pass_cnt
+
+    FROM pass_detail
+
+    GROUP BY send_date
+),
+
+
+/* ============================================================
+   14. Eligible / TCL
+   ============================================================ */
+
+eligible_agg AS (
+
+    SELECT
+        send_date,
+
+        COUNT(DISTINCT phone) AS eligible_cnt,
+
+        SUM(total_quota_amount) AS total_tcl
+
+    FROM eligible_detail
+
+    GROUP BY send_date
+),
+
+
+/* ============================================================
+   15. Usage
+   ============================================================ */
+
+usage_agg AS (
+
+    SELECT
+        send_date,
+
+        COUNT(DISTINCT phone) AS usage_user_cnt,
+
+        COUNT(DISTINCT change_id) AS usage_order_cnt,
+
+        SUM(change_amount) AS usage_amount
+
+    FROM usage_detail
+
+    GROUP BY send_date
+)
+
+
+/* ============================================================
+   16. 最终每日24H漏斗
+   ============================================================ */
+
+SELECT
+
+    s.send_date AS `短信发送日期`,
+
+    /* 绝对指标 */
+
+    s.sms_cnt AS `短信成功触达人数`,
+
+    COALESCE(o.optin_cnt, 0)
+        AS `24H_OPT_IN人数`,
+
+    COALESCE(a.apply_cnt, 0)
+        AS `24H_Apply人数`,
+
+    COALESCE(p.pass_cnt, 0)
+        AS `24H_PASS人数`,
+
+    COALESCE(e.eligible_cnt, 0)
+        AS `Eligible人数`,
+
+    COALESCE(e.total_tcl, 0)
+        AS `TCL总额`,
+
+    COALESCE(u.usage_user_cnt, 0)
+        AS `24H用信用户数`,
+
+    COALESCE(u.usage_order_cnt, 0)
+        AS `24H用信笔数`,
+
+    COALESCE(u.usage_amount, 0)
+        AS `24H用信金额`,
+
+
+    /* 1. SMS → OPT_IN */
+
+    CONCAT(
+        ROUND(
+            COALESCE(o.optin_cnt, 0) * 100.0
+            /
+            NULLIF(s.sms_cnt, 0),
+            2
+        ),
+        '%'
+    ) AS `OPT_IN率`,
+
+
+    /* 2. OPT_IN → Apply */
+
+    CONCAT(
+        ROUND(
+            COALESCE(a.apply_cnt, 0) * 100.0
+            /
+            NULLIF(o.optin_cnt, 0),
+            2
+        ),
+        '%'
+    ) AS `Apply转化率`,
+
+
+    /* 3. Apply → PASS */
+
+    CONCAT(
+        ROUND(
+            COALESCE(p.pass_cnt, 0) * 100.0
+            /
+            NULLIF(a.apply_cnt, 0),
+            2
+        ),
+        '%'
+    ) AS `PASS通过率`,
+
+
+    /* 4. PASS → Eligible */
+
+    CONCAT(
+        ROUND(
+            COALESCE(e.eligible_cnt, 0) * 100.0
+            /
+            NULLIF(p.pass_cnt, 0),
+            2
+        ),
+        '%'
+    ) AS `Eligible率`,
+
+
+    /* 5. Eligible → Usage */
+
+    CONCAT(
+        ROUND(
+            COALESCE(u.usage_user_cnt, 0) * 100.0
+            /
+            NULLIF(e.eligible_cnt, 0),
+            2
+        ),
+        '%'
+    ) AS `用信率`,
+
+
+    /* 6. SMS → Usage */
+
+    CONCAT(
+        ROUND(
+            COALESCE(u.usage_user_cnt, 0) * 100.0
+            /
+            NULLIF(s.sms_cnt, 0),
+            2
+        ),
+        '%'
+    ) AS `用信/短信成功触达`
+
+FROM sms_agg s
+
+LEFT JOIN optin_agg o
+    ON s.send_date = o.send_date
+
+LEFT JOIN apply_agg a
+    ON s.send_date = a.send_date
+
+LEFT JOIN pass_agg p
+    ON s.send_date = p.send_date
+
+LEFT JOIN eligible_agg e
+    ON s.send_date = e.send_date
+
+LEFT JOIN usage_agg u
+    ON s.send_date = u.send_date
+
+ORDER BY s.send_date;
