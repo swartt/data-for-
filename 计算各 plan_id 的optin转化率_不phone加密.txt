@@ -1,0 +1,134 @@
+-- 计算各 plan_id 的 OPT-IN T0 转化率（区分 plan_id）
+
+WITH send_user AS
+(
+    -- 1. 获取指定日期、指定 plan 成功发送用户
+    SELECT DISTINCT
+        plan_id,
+        phone,
+        DATE(send_time) AS send_date
+    FROM ug_analysis_dw_prod.ods_mtn_t_message_record_rt
+    WHERE plan_id BETWEEN 3117 AND 3120
+      AND send_success = 1
+      AND DATE(send_time) = '2026-08-11'
+),
+
+customer_first AS
+(
+    -- 2. 获取每个手机号首次进入 customer 表的日期
+    SELECT
+        phone,
+        MIN(DATE(create_time)) AS first_create_date
+    FROM ug_analysis_dw_prod.ods_mtn_b_customer
+    GROUP BY phone
+)
+
+SELECT
+    s.send_date,
+    s.plan_id,
+
+    -- 成功发送用户数
+    COUNT(DISTINCT s.phone) AS `成功发送用户数`,
+
+    -- T0 当天首次落到 customer 的用户数
+    COUNT(DISTINCT CASE
+        WHEN c.first_create_date = s.send_date
+        THEN s.phone
+    END) AS `OPT_IN_T0转化用户数`,
+
+    -- T0 转化率
+    CONCAT(
+        ROUND(
+            COUNT(DISTINCT CASE
+                WHEN c.first_create_date = s.send_date
+                THEN s.phone
+            END)
+            /
+            NULLIF(COUNT(DISTINCT s.phone), 0)
+            * 100,
+            2
+        ),
+        '%'
+    ) AS `OPT_IN_T0转化率`
+
+FROM send_user s
+
+LEFT JOIN customer_first c
+    ON s.phone = c.phone
+
+GROUP BY
+    s.send_date,
+    s.plan_id
+
+ORDER BY
+    s.send_date,
+    s.plan_id;
+
+
+----optin率 （不区分plan_id)
+-- 计算OPT_IN转化率
+-- 不对message_record.phone进行解密
+
+WITH send_user AS
+(
+    -- 1. 获取指定日期、指定plan的成功发送用户
+    SELECT DISTINCT
+        phone,
+        DATE(send_time) AS send_date
+
+    FROM ug_analysis_dw_prod.ods_mtn_t_message_record_rt
+
+    WHERE plan_id BETWEEN 3121 AND 3124
+      AND send_success = 1
+      AND DATE(send_time) = '2026-08-12'
+),
+
+customer_first AS
+(
+    -- 2. 获取每个手机号首次进入Customer表的日期
+    SELECT
+        phone,
+        MIN(DATE(create_time)) AS first_create_date
+
+    FROM ug_analysis_dw_prod.ods_mtn_b_customer
+
+    GROUP BY phone
+)
+
+SELECT
+    s.send_date,
+
+    -- 3. 成功发送用户数
+    COUNT(DISTINCT s.phone) AS `成功发送用户数`,
+
+    -- 4. T0当天首次进入Customer的用户数
+    COUNT(DISTINCT CASE
+        WHEN c.first_create_date = s.send_date
+        THEN s.phone
+    END) AS `OPT_IN_T0转化用户数`,
+
+    -- 5. T0 OPT_IN转化率
+    CONCAT(
+        ROUND(
+            COUNT(DISTINCT CASE
+                WHEN c.first_create_date = s.send_date
+                THEN s.phone
+            END)
+            /
+            NULLIF(COUNT(DISTINCT s.phone), 0)
+            * 100,
+            2
+        ),
+        '%'
+    ) AS `OPT_IN_T0转化率`
+
+FROM send_user s
+
+LEFT JOIN customer_first c
+    ON s.phone = c.phone
+
+GROUP BY s.send_date
+
+ORDER BY s.send_date;
+
+

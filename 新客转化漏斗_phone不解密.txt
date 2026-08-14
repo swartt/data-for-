@@ -1,0 +1,315 @@
+-- 新客结果：phone不解密
+
+WITH params AS (
+    SELECT DATE('2026-08-11') AS cohort_date
+),
+
+periods AS (
+    SELECT
+        'T0' AS period,
+        cohort_date AS start_date,
+        cohort_date AS end_date
+    FROM params
+
+    UNION ALL
+
+    SELECT
+        'T1' AS period,
+        cohort_date AS start_date,
+        DATE_ADD(cohort_date, INTERVAL 1 DAY) AS end_date
+    FROM params
+),
+
+/* 1. 指定日期 plan 3117~3120 成功短信用户
+   phone直接使用原始字段，不进行解密 */
+sms_user AS (
+    SELECT
+        r.phone AS phone,
+        MIN(r.send_time) AS first_send_time
+
+    FROM ug_analysis_dw_prod.ods_mtn_t_message_record_rt r
+
+    CROSS JOIN params p
+
+    WHERE DATE(r.send_time) = p.cohort_date
+      AND r.send_success = 1
+      AND r.plan_id BETWEEN 3117 AND 3120
+
+    GROUP BY r.phone
+),
+
+/* 2. 每个手机号首次OPT_IN / Customer */
+customer_rank AS (
+    SELECT
+        id AS customer_id,
+        phone,
+        create_time,
+
+        ROW_NUMBER() OVER (
+            PARTITION BY phone
+            ORDER BY create_time, id
+        ) AS rn
+
+    FROM ug_analysis_dw_prod.ods_mtn_b_customer
+),
+
+customer_first AS (
+    SELECT
+        customer_id,
+        phone,
+        create_time AS first_customer_time
+
+    FROM customer_rank
+
+    WHERE rn = 1
+),
+
+/* 3. 新客母群：短信前从未OPT_IN */
+new_sms_cohort AS (
+    SELECT
+        s.phone,
+        s.first_send_time,
+        c.customer_id,
+        c.first_customer_time
+
+    FROM sms_user s
+
+    LEFT JOIN customer_first c
+        ON s.phone = c.phone
+
+    WHERE c.first_customer_time IS NULL
+       OR c.first_customer_time >= s.first_send_time
+),
+
+/* 4. T0 / T1窗口 */
+cohort_window AS (
+    SELECT
+        p.period,
+        p.start_date,
+        p.end_date,
+
+        c.phone,
+        c.first_send_time,
+        c.customer_id,
+        c.first_customer_time,
+
+        CASE
+            WHEN c.first_customer_time >= c.first_send_time
+             AND c.first_customer_time < DATE_ADD(p.end_date, INTERVAL 1 DAY)
+            THEN 1
+            ELSE 0
+        END AS optin_flag
+
+    FROM periods p
+
+    CROSS JOIN new_sms_cohort c
+),
+
+/* 5. 已OPT_IN后发生的Apply */
+apply_detail AS (
+    SELECT
+        c.period,
+        c.phone,
+        c.customer_id,
+
+        a.overdraft_id,
+        a.create_time AS apply_time,
+        a.apply_result
+
+    FROM cohort_window c
+
+    JOIN ug_analysis_dw_prod.ods_mtn_b_credit_apply a
+        ON c.customer_id = a.customer_id
+       AND a.create_time >= c.first_customer_time
+       AND a.create_time < DATE_ADD(c.end_date, INTERVAL 1 DAY)
+
+    WHERE c.optin_flag = 1
+),
+
+/* 6. Apply中的PASS */
+pass_detail AS (
+    SELECT DISTINCT
+        period,
+        phone,
+        customer_id,
+        overdraft_id
+
+    FROM apply_detail
+
+    WHERE apply_result = 'PASS'
+),
+
+/* 7. 正常批额 */
+effective_quota AS (
+    SELECT DISTINCT
+        p.period,
+        p.phone,
+        p.customer_id,
+        p.overdraft_id,
+        q.total_quota_amount
+
+    FROM pass_detail p
+
+    JOIN ug_analysis_dw_prod.ods_mtn_b_customer_quota q
+        ON p.overdraft_id = q.overdraft_id
+       AND q.total_quota_amount > 1
+),
+
+/* 8. 正常批额后，在T0/T1窗口内产生USAGE */
+usage_detail AS (
+    SELECT
+        q.period,
+        q.phone,
+        q.customer_id,
+        q.overdraft_id,
+
+        f.change_id,
+        f.change_time,
+        f.change_amount
+
+    FROM effective_quota q
+
+    JOIN periods w
+        ON q.period = w.period
+
+    JOIN ug_analysis_dw_prod.ods_mtn_b_customer_quota_flow f
+        ON q.overdraft_id = f.overdraft_id
+       AND f.change_type = 'USAGE'
+       AND DATE(f.change_time) BETWEEN w.start_date AND w.end_date
+),
+
+/* 9. 短信 → OPT_IN */
+funnel AS (
+    SELECT
+        period,
+
+        MIN(start_date) AS start_date,
+        MIN(end_date) AS end_date,
+
+        COUNT(DISTINCT phone) AS sms_user_cnt,
+
+        COUNT(
+            DISTINCT CASE
+                WHEN optin_flag = 1
+                THEN phone
+            END
+        ) AS optin_cnt
+
+    FROM cohort_window
+
+    GROUP BY period
+),
+
+/* 10. Apply人数 */
+apply_agg AS (
+    SELECT
+        period,
+        COUNT(DISTINCT phone) AS apply_cnt
+
+    FROM apply_detail
+
+    GROUP BY period
+),
+
+/* 11. PASS人数 */
+pass_agg AS (
+    SELECT
+        period,
+        COUNT(DISTINCT phone) AS pass_cnt
+
+    FROM pass_detail
+
+    GROUP BY period
+),
+
+/* 12. 正常批额人数 */
+quota_agg AS (
+    SELECT
+        period,
+        COUNT(DISTINCT phone) AS effective_quota_cnt
+
+    FROM effective_quota
+
+    GROUP BY period
+),
+
+/* 13. 用信 */
+usage_agg AS (
+    SELECT
+        period,
+
+        COUNT(DISTINCT phone) AS usage_user_cnt,
+        COUNT(DISTINCT change_id) AS usage_order_cnt,
+        SUM(change_amount) AS usage_amount
+
+    FROM usage_detail
+
+    GROUP BY period
+)
+
+SELECT
+    f.period AS `周期`,
+    f.start_date AS `开始日期`,
+    f.end_date AS `截止日期`,
+
+    f.sms_user_cnt AS `短信新客触达人数`,
+    f.optin_cnt AS `OPT_IN人数`,
+
+    COALESCE(a.apply_cnt, 0) AS `Apply人数`,
+    COALESCE(p.pass_cnt, 0) AS `PASS人数`,
+    COALESCE(q.effective_quota_cnt, 0) AS `正常批额人数`,
+
+    COALESCE(u.usage_user_cnt, 0) AS `用信用户数`,
+    COALESCE(u.usage_order_cnt, 0) AS `用信笔数`,
+    COALESCE(u.usage_amount, 0) AS `用信总金额`,
+
+    /* OPT_IN / 短信触达 */
+    ROUND(
+        f.optin_cnt * 1.0
+        / NULLIF(f.sms_user_cnt, 0),
+        4
+    ) AS `OPT_IN率`,
+
+    /* Apply / OPT_IN */
+    ROUND(
+        COALESCE(a.apply_cnt, 0) * 1.0
+        / NULLIF(f.optin_cnt, 0),
+        4
+    ) AS `Apply转化率`,
+
+    /* PASS / Apply */
+    ROUND(
+        COALESCE(p.pass_cnt, 0) * 1.0
+        / NULLIF(a.apply_cnt, 0),
+        4
+    ) AS `PASS通过率`,
+
+    /* 正常批额 / PASS */
+    ROUND(
+        COALESCE(q.effective_quota_cnt, 0) * 1.0
+        / NULLIF(p.pass_cnt, 0),
+        4
+    ) AS `正常批额率`,
+
+    /* 用信 / 正常批额 */
+    ROUND(
+        COALESCE(u.usage_user_cnt, 0) * 1.0
+        / NULLIF(q.effective_quota_cnt, 0),
+        4
+    ) AS `用信率`
+
+FROM funnel f
+
+LEFT JOIN apply_agg a
+    ON f.period = a.period
+
+LEFT JOIN pass_agg p
+    ON f.period = p.period
+
+LEFT JOIN quota_agg q
+    ON f.period = q.period
+
+LEFT JOIN usage_agg u
+    ON f.period = u.period
+
+ORDER BY f.period;
