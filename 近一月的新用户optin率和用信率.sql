@@ -23,7 +23,7 @@ WITH sms_raw AS (
     WHERE DATE(r.send_time) BETWEEN '2026-07-11' AND '2026-08-11'
       AND r.send_success = 1
       AND r.plan_id BETWEEN 3032 AND 3120
-      AND r.plan_id NOT IN (3069, 3070, 3071, 3081)
+      AND r.plan_id NOT IN (3069, 3070, 3071, 3072, 3081)
 ),
 
 sms_user AS (
