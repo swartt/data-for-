@@ -1,0 +1,402 @@
+WITH eligible_rank AS (
+    /* ========================================================
+       1. 找每个用户首次成为Eligible的时间
+
+       Eligible定义：
+       change_type = 'ACTIVE'
+       AND original_amount > 1
+
+       注意：
+       这是所有后续人群分组的前置条件
+       ======================================================== */
+    SELECT
+        customer_id,
+        change_time,
+        original_amount,
+
+        ROW_NUMBER() OVER (
+            PARTITION BY customer_id
+            ORDER BY change_time ASC
+        ) AS rn
+
+    FROM ug_analysis_dw_prod.ods_mtn_b_customer_quota_flow
+
+    WHERE change_type = 'ACTIVE'
+      AND original_amount > 1
+      AND product_code = 'MoMoAdvance'
+),
+
+first_eligible AS (
+    /* ========================================================
+       2. 每个用户首次Eligible
+       ======================================================== */
+    SELECT
+        customer_id,
+
+        change_time AS first_eligible_time,
+
+        DATE(change_time) AS first_eligible_date,
+
+        DATE_FORMAT(
+            change_time,
+            '%Y-%m'
+        ) AS first_eligible_month,
+
+        original_amount AS first_eligible_amount
+
+    FROM eligible_rank
+
+    WHERE rn = 1
+),
+
+adjust_0814_raw AS (
+    /* ========================================================
+       3. 8月14日发生调额的用户
+
+       INCREASE
+       REDUCE
+
+       这批用户业务上已经确认：
+       8/14以前已经Eligible并正常使用
+       ======================================================== */
+    SELECT
+        customer_id,
+        change_type,
+        change_time,
+
+        ROW_NUMBER() OVER (
+            PARTITION BY customer_id
+            ORDER BY change_time DESC
+        ) AS rn
+
+    FROM ug_analysis_dw_prod.ods_mtn_b_customer_quota_flow
+
+    WHERE DATE(change_time) = '2026-08-14'
+      AND change_type IN (
+          'INCREASE',
+          'REDUCE'
+      )
+      AND product_code = 'MoMoAdvance'
+),
+
+adjust_0814 AS (
+    /* ========================================================
+       4. 同一个用户8/14如果有多条调额记录，
+          只取当天最后一次调额状态
+
+       避免Join后放款金额被重复
+       ======================================================== */
+    SELECT
+        customer_id,
+        change_type
+
+    FROM adjust_0814_raw
+
+    WHERE rn = 1
+),
+
+eligible_user_tag AS (
+    /* ========================================================
+       5. 给所有Eligible用户增加8/14调额标签
+       ======================================================== */
+    SELECT
+        e.customer_id,
+        e.first_eligible_time,
+        e.first_eligible_date,
+        e.first_eligible_month,
+        e.first_eligible_amount,
+
+        a.change_type AS adjust_type
+
+    FROM first_eligible e
+
+    LEFT JOIN adjust_0814 a
+        ON e.customer_id = a.customer_id
+),
+
+lend_transactions AS (
+    /* ========================================================
+       6. 观察期内所有MoMoAdvance真实用信/LEND
+
+       时间：
+       2026-07-14 ~ 2026-08-16
+
+       只保留已经成为Eligible的用户
+       ======================================================== */
+    SELECT
+        DATE(t.transaction_time) AS stat_date,
+
+        DATE_FORMAT(
+            t.transaction_time,
+            '%Y-%m'
+        ) AS stat_month,
+
+        t.transaction_time,
+
+        t.transaction_id,
+
+        t.customer_id,
+
+        t.account_fri,
+
+        t.transaction_amount,
+
+        e.first_eligible_time,
+        e.first_eligible_date,
+        e.first_eligible_month,
+        e.adjust_type
+
+    FROM ug_analysis_dw_prod.ods_mtn_b_trans_record t
+
+    INNER JOIN eligible_user_tag e
+        ON t.customer_id = e.customer_id
+
+    WHERE t.transaction_type = 'LEND'
+
+      AND t.product_code = 'MoMoAdvance'
+
+      AND DATE(t.transaction_time)
+              BETWEEN '2026-07-14' AND '2026-08-16'
+
+      AND t.overdraft_id IS NOT NULL
+
+      AND COALESCE(t.deleted, 0) = 0
+
+      /* 防止异常：
+         LEND必须发生在首次Eligible之后 */
+      AND t.transaction_time >= e.first_eligible_time
+),
+
+final_tags AS (
+    /* ========================================================
+       7. 最终互斥人群分组
+
+       优先级：
+
+       1. INCREASE
+       2. REDUCE
+       3. T0_24H
+       4. MoB0
+       5. MoB1+
+       6. Not Eligible
+
+       ======================================================== */
+    SELECT
+        stat_date,
+
+        customer_id,
+
+        account_fri,
+
+        transaction_id,
+
+        transaction_time,
+
+        transaction_amount,
+
+        CASE
+
+            /* -----------------------------------------------
+               8/14增额用户
+               调额用户优先级最高
+               ----------------------------------------------- */
+            WHEN adjust_type = 'INCREASE'
+            THEN '1_INCREASE'
+
+
+            /* -----------------------------------------------
+               8/14降额用户
+               ----------------------------------------------- */
+            WHEN adjust_type = 'REDUCE'
+            THEN '2_REDUCE'
+
+
+            /* -----------------------------------------------
+               首次Eligible后的24小时以内产生用信
+
+               例如：
+               Eligible：8/1 15:00
+               LEND：8/2 10:00
+
+               虽然跨自然日，但仍小于24H，
+               因此属于T0_24H。
+               ----------------------------------------------- */
+            WHEN transaction_time >= first_eligible_time
+             AND transaction_time
+                    < DATE_ADD(
+                        first_eligible_time,
+                        INTERVAL 24 HOUR
+                    )
+            THEN '3_T0_24H'
+
+
+            /* -----------------------------------------------
+               MoB0：
+
+               首次Eligible当月产生用信，
+               但已经超过首次Eligible后的24H
+               ----------------------------------------------- */
+            WHEN stat_month = first_eligible_month
+            THEN '4_MoB0'
+
+
+            /* -----------------------------------------------
+               MoB1+：
+
+               LEND月份晚于首次Eligible月份
+               ----------------------------------------------- */
+            WHEN stat_month > first_eligible_month
+            THEN '5_MoB1_Plus'
+
+
+            /* 理论异常校验 */
+            ELSE '6_Not_Eligible'
+
+        END AS final_user_group
+
+    FROM lend_transactions
+),
+
+daily_group AS (
+    /* ========================================================
+       8. 每天 × 人群汇总
+       ======================================================== */
+    SELECT
+        stat_date,
+
+        final_user_group,
+
+        COUNT(
+            DISTINCT customer_id
+        ) AS group_user_cnt,
+
+        COUNT(
+            DISTINCT transaction_id
+        ) AS group_lend_order_cnt,
+
+        SUM(
+            transaction_amount
+        ) AS group_lend_amount
+
+    FROM final_tags
+
+    GROUP BY
+        stat_date,
+        final_user_group
+),
+
+daily_total AS (
+    /* ========================================================
+       9. 每日整体用信
+
+       单独从原始final_tags统计每日去重用户，
+       避免简单SUM各组人数产生潜在重复问题
+       ======================================================== */
+    SELECT
+        stat_date,
+
+        COUNT(
+            DISTINCT customer_id
+        ) AS total_user_cnt,
+
+        COUNT(
+            DISTINCT transaction_id
+        ) AS total_lend_order_cnt,
+
+        SUM(
+            transaction_amount
+        ) AS total_lend_amount
+
+    FROM final_tags
+
+    GROUP BY stat_date
+)
+
+SELECT
+    g.stat_date AS `日期`,
+
+    g.final_user_group AS `用户分组`,
+
+    /* =========================
+       用信用户
+       ========================= */
+
+    g.group_user_cnt
+        AS `分组用信用户数`,
+
+    t.total_user_cnt
+        AS `当日总用信用户数`,
+
+    CONCAT(
+        ROUND(
+            g.group_user_cnt * 100.0
+            /
+            NULLIF(
+                t.total_user_cnt,
+                0
+            ),
+            2
+        ),
+        '%'
+    ) AS `用信用户占比`,
+
+
+    /* =========================
+       用信笔数
+       ========================= */
+
+    g.group_lend_order_cnt
+        AS `分组用信笔数`,
+
+    t.total_lend_order_cnt
+        AS `当日总用信笔数`,
+
+    CONCAT(
+        ROUND(
+            g.group_lend_order_cnt * 100.0
+            /
+            NULLIF(
+                t.total_lend_order_cnt,
+                0
+            ),
+            2
+        ),
+        '%'
+    ) AS `用信笔数占比`,
+
+
+    /* =========================
+       用信金额
+       ========================= */
+
+    ROUND(
+        g.group_lend_amount,
+        2
+    ) AS `分组用信金额`,
+
+    ROUND(
+        t.total_lend_amount,
+        2
+    ) AS `当日总用信金额`,
+
+    CONCAT(
+        ROUND(
+            g.group_lend_amount * 100.0
+            /
+            NULLIF(
+                t.total_lend_amount,
+                0
+            ),
+            2
+        ),
+        '%'
+    ) AS `用信金额占比`
+
+FROM daily_group g
+
+JOIN daily_total t
+    ON g.stat_date = t.stat_date
+
+ORDER BY
+    g.stat_date,
+    g.final_user_group;
