@@ -1,0 +1,137 @@
+------限定调整日期为8.14 & 计算T-5~T+5的用信人数(8.14 increase用户为基础）
+SELECT
+    DATE(t.create_time) AS adjust_date,
+
+    -- 8/14增额用户数
+    COUNT(DISTINCT t.customer_id) AS increase_cnt,
+
+    /* =========================
+       增额前历史用信
+       非累计：分别看T-1 ~ T-5当天
+       ========================= */
+
+    COUNT(DISTINCT CASE
+        WHEN DATEDIFF(
+            DATE(t2.create_time),
+            DATE(t.create_time)
+        ) = -1
+        THEN t.customer_id
+    END) AS `T-1_use`,
+
+    COUNT(DISTINCT CASE
+        WHEN DATEDIFF(
+            DATE(t2.create_time),
+            DATE(t.create_time)
+        ) = -2
+        THEN t.customer_id
+    END) AS `T-2_use`,
+
+    COUNT(DISTINCT CASE
+        WHEN DATEDIFF(
+            DATE(t2.create_time),
+            DATE(t.create_time)
+        ) = -3
+        THEN t.customer_id
+    END) AS `T-3_use`,
+
+    COUNT(DISTINCT CASE
+        WHEN DATEDIFF(
+            DATE(t2.create_time),
+            DATE(t.create_time)
+        ) = -4
+        THEN t.customer_id
+    END) AS `T-4_use`,
+
+    COUNT(DISTINCT CASE
+        WHEN DATEDIFF(
+            DATE(t2.create_time),
+            DATE(t.create_time)
+        ) = -5
+        THEN t.customer_id
+    END) AS `T-5_use`,
+
+
+    /* =========================
+       增额后累计用信
+       完全保留原代码逻辑
+       ========================= */
+
+    COUNT(DISTINCT CASE
+        WHEN DATEDIFF(
+            DATE(t2.create_time),
+            DATE(t.create_time)
+        ) BETWEEN 0 AND 0
+        THEN t.customer_id
+    END) AS T0_use,
+
+    COUNT(DISTINCT CASE
+        WHEN DATEDIFF(
+            DATE(t2.create_time),
+            DATE(t.create_time)
+        ) BETWEEN 0 AND 1
+        THEN t.customer_id
+    END) AS T1_use,
+
+    COUNT(DISTINCT CASE
+        WHEN DATEDIFF(
+            DATE(t2.create_time),
+            DATE(t.create_time)
+        ) BETWEEN 0 AND 2
+        THEN t.customer_id
+    END) AS T2_use,
+
+    COUNT(DISTINCT CASE
+        WHEN DATEDIFF(
+            DATE(t2.create_time),
+            DATE(t.create_time)
+        ) BETWEEN 0 AND 3
+        THEN t.customer_id
+    END) AS T3_use,
+
+    COUNT(DISTINCT CASE
+        WHEN DATEDIFF(
+            DATE(t2.create_time),
+            DATE(t.create_time)
+        ) BETWEEN 0 AND 4
+        THEN t.customer_id
+    END) AS T4_use,
+
+    COUNT(DISTINCT CASE
+        WHEN DATEDIFF(
+            DATE(t2.create_time),
+            DATE(t.create_time)
+        ) BETWEEN 0 AND 5
+        THEN t.customer_id
+    END) AS T5_use
+
+FROM ug_analysis_dw_prod.ods_mtn_b_customer_quota_flow t
+
+LEFT JOIN ug_analysis_dw_prod.ods_mtn_b_trans_record t2
+    ON t.customer_id = t2.customer_id
+   AND t2.transaction_type = 'LEND'
+
+WHERE t.change_type = 'INCREASE'
+
+  -- 只看8/14当天发生增额的用户
+  AND DATE(t.create_time) = '2026-08-14'
+
+GROUP BY DATE(t.create_time)
+
+ORDER BY adjust_date;
+
+
+--------计算所有调额发生日的T0~T5用信人数(各调额日 increase用户为基础）
+select date(t.create_time) adjust_date
+,COUNT(distinct t.customer_id ) increase_cnt
+,COUNT(distinct case when DATEDIFF(date(t2.create_time ),date(t.create_time )) BETWEEN 0 and 0 then  t.customer_id  end) T0_use
+,COUNT(distinct case when DATEDIFF(date(t2.create_time ),date(t.create_time )) BETWEEN 0 and 1 then  t.customer_id  end)T1_use
+,COUNT(distinct case when DATEDIFF(date(t2.create_time ),date(t.create_time )) BETWEEN 0 and 2 then  t.customer_id  end)T2_use
+,COUNT(distinct case when DATEDIFF(date(t2.create_time ),date(t.create_time )) BETWEEN 0 and 3 then  t.customer_id  end)T3_use
+,COUNT(distinct case when DATEDIFF(date(t2.create_time ),date(t.create_time )) BETWEEN 0 and 4 then  t.customer_id  end)T4_use
+,COUNT(distinct case when DATEDIFF(date(t2.create_time ),date(t.create_time )) BETWEEN 0 and 5 then  t.customer_id  end)T5_use
+from 
+ug_analysis_dw_prod.ods_mtn_b_customer_quota_flow t left join ug_analysis_dw_prod.ods_mtn_b_trans_record t2 on t.customer_id = t2.customer_id  and t2.transaction_type = 'LEND'
+where t.change_type  in ('INCREASE' )
+group by date(t.create_time)
+order by adjust_date
+ ;
