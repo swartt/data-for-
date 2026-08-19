@@ -1,0 +1,320 @@
+WITH ab_raw AS (
+    /* ========================================================
+       1. 获取 plan_id = 3162 的 A/B/C 实验分组
+       ======================================================== */
+    SELECT
+        t.phone,
+        t.start_time,
+        GET_JSON_STRING(t.output_param, '$.name') AS test_group,
+
+        ROW_NUMBER() OVER (
+            PARTITION BY t.phone
+            ORDER BY t.start_time
+        ) AS rn
+
+    FROM ug_analysis_dw_prod.ods_mtn_process_business_node t
+
+    WHERE t.plan_id = '3162'
+      AND t.element_type = 'AB_TEST'
+      AND GET_JSON_STRING(t.output_param, '$.name') IN ('A', 'B', 'C')
+),
+
+ab_base AS (
+    /* ========================================================
+       2. 每个手机号只保留一条实验分组记录
+       ======================================================== */
+    SELECT
+        phone,
+        start_time,
+        test_group
+
+    FROM ab_raw
+
+    WHERE rn = 1
+),
+
+sms_success AS (
+    /* ========================================================
+       3. A/B组：验证短信确实成功发送
+
+       这里通过 phone 关联短信发送记录
+       ======================================================== */
+    SELECT
+        m.phone,
+        MIN(m.send_time) AS first_send_time
+
+    FROM ug_analysis_dw_prod.ods_mtn_t_message_record_rt m
+
+    WHERE m.plan_id = '3162'
+      AND m.send_success = 1
+
+    GROUP BY m.phone
+),
+
+experiment_phone_base AS (
+    /* ========================================================
+       4. 构建最终实验手机号母群
+
+       A/B：
+       必须找到成功发送短信记录
+
+       C：
+       不发短信，直接保留
+       ======================================================== */
+    SELECT
+        a.phone,
+        a.start_time,
+        a.test_group
+
+    FROM ab_base a
+
+    LEFT JOIN sms_success s
+        ON a.phone = s.phone
+
+    WHERE
+        (
+            a.test_group IN ('A', 'B')
+            AND s.phone IS NOT NULL
+        )
+        OR
+        (
+            a.test_group = 'C'
+        )
+),
+
+customer_rank AS (
+    /* ========================================================
+       5. phone → b_customer.id
+
+       如果同一个phone在customer表存在多条记录，
+       取最早一条作为customer_id映射
+       ======================================================== */
+    SELECT
+        id AS customer_id,
+        phone,
+        create_time,
+
+        ROW_NUMBER() OVER (
+            PARTITION BY phone
+            ORDER BY create_time, id
+        ) AS rn
+
+    FROM ug_analysis_dw_prod.ods_mtn_b_customer
+),
+
+customer_mapping AS (
+    SELECT
+        customer_id,
+        phone
+
+    FROM customer_rank
+
+    WHERE rn = 1
+),
+
+experiment_cohort AS (
+    /* ========================================================
+       6. 实验手机号 → trans_record使用的customer_id
+       ======================================================== */
+    SELECT
+        e.phone,
+        e.start_time,
+        e.test_group,
+        c.customer_id
+
+    FROM experiment_phone_base e
+
+    JOIN customer_mapping c
+        ON e.phone = c.phone
+),
+
+lend_24h AS (
+    /* ========================================================
+       7. 统计实验开始后24H内的LEND
+
+       所有A/B/C组统一：
+       [start_time, start_time + 24H)
+       ======================================================== */
+    SELECT
+        c.test_group,
+        c.customer_id,
+
+        t.transaction_id,
+        t.transaction_time,
+        t.transaction_amount
+
+    FROM experiment_cohort c
+
+    JOIN ug_analysis_dw_prod.ods_mtn_b_trans_record t
+        ON c.customer_id = t.customer_id
+
+       AND t.transaction_type = 'LEND'
+
+       AND t.transaction_time >= c.start_time
+
+       AND t.transaction_time
+           < DATE_ADD(
+               c.start_time,
+               INTERVAL 24 HOUR
+           )
+),
+
+base_agg AS (
+    /* ========================================================
+       8. 各实验组母群人数
+       ======================================================== */
+    SELECT
+        test_group,
+
+        COUNT(DISTINCT customer_id)
+            AS experiment_user_cnt
+
+    FROM experiment_cohort
+
+    GROUP BY test_group
+),
+
+lend_agg AS (
+    /* ========================================================
+       9. 各实验组24H用信表现
+       ======================================================== */
+    SELECT
+        test_group,
+
+        COUNT(DISTINCT customer_id)
+            AS lend_user_cnt_24h,
+
+        COUNT(DISTINCT transaction_id)
+            AS lend_order_cnt_24h,
+
+        SUM(transaction_amount)
+            AS lend_amount_24h
+
+    FROM lend_24h
+
+    GROUP BY test_group
+),
+
+result AS (
+    /* ========================================================
+       10. 计算各组24H用信率
+       ======================================================== */
+    SELECT
+        b.test_group,
+
+        b.experiment_user_cnt,
+
+        COALESCE(
+            l.lend_user_cnt_24h,
+            0
+        ) AS lend_user_cnt_24h,
+
+        COALESCE(
+            l.lend_order_cnt_24h,
+            0
+        ) AS lend_order_cnt_24h,
+
+        COALESCE(
+            l.lend_amount_24h,
+            0
+        ) AS lend_amount_24h,
+
+        COALESCE(
+            l.lend_user_cnt_24h,
+            0
+        ) * 1.0
+        /
+        NULLIF(
+            b.experiment_user_cnt,
+            0
+        ) AS lend_rate_24h
+
+    FROM base_agg b
+
+    LEFT JOIN lend_agg l
+        ON b.test_group = l.test_group
+),
+
+control_rate AS (
+    /* ========================================================
+       11. 单独取C组用信率，方便计算A/B Lift
+       ======================================================== */
+    SELECT
+        lend_rate_24h AS c_lend_rate_24h
+
+    FROM result
+
+    WHERE test_group = 'C'
+)
+
+SELECT
+    r.test_group AS `实验组`,
+
+    r.experiment_user_cnt AS `实验用户数`,
+
+    r.lend_user_cnt_24h AS `24H用信用户数`,
+
+    r.lend_order_cnt_24h AS `24H用信笔数`,
+
+    ROUND(
+        r.lend_amount_24h,
+        2
+    ) AS `24H用信金额`,
+
+    CONCAT(
+        ROUND(
+            r.lend_rate_24h * 100,
+            2
+        ),
+        '%'
+    ) AS `24H用信率`,
+
+    /* A/B相对C组的绝对百分点提升 */
+    CASE
+        WHEN r.test_group IN ('A', 'B')
+        THEN CONCAT(
+            ROUND(
+                (
+                    r.lend_rate_24h
+                    -
+                    c.c_lend_rate_24h
+                ) * 100,
+                2
+            ),
+            'pp'
+        )
+        ELSE NULL
+    END AS `vs_C用信率提升`,
+
+    /* A/B相对C组的相对Lift */
+    CASE
+        WHEN r.test_group IN ('A', 'B')
+        THEN CONCAT(
+            ROUND(
+                (
+                    r.lend_rate_24h
+                    /
+                    NULLIF(
+                        c.c_lend_rate_24h,
+                        0
+                    )
+                    - 1
+                ) * 100,
+                2
+            ),
+            '%'
+        )
+        ELSE NULL
+    END AS `vs_C相对Lift`
+
+FROM result r
+
+CROSS JOIN control_rate c
+
+ORDER BY
+    CASE
+        WHEN r.test_group = 'A' THEN 1
+        WHEN r.test_group = 'B' THEN 2
+        WHEN r.test_group = 'C' THEN 3
+        ELSE 4
+    END;
