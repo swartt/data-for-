@@ -1,0 +1,18 @@
+------数据明细
+SELECT
+    etl_data_normalize_decrypt_udf(phone) AS `MSISDN`,
+    MIN(create_time) AS `Timestamp`
+FROM ug_analysis_dw_prod.ods_mtn_b_credit_apply
+WHERE DATE(create_time) = '2026-08-18'
+  AND apply_result = 'PASS'
+GROUP BY phone
+ORDER BY `Timestamp`;
+
+
+-----量级
+SELECT
+    COUNT(DISTINCT customer_id) AS `8月18日成功OPT_IN用户数`
+FROM ug_analysis_dw_prod.ods_mtn_b_credit_apply
+WHERE create_time >= '2026-08-18 00:00:00'
+  AND create_time <  '2026-08-19 00:00:00'
+  AND apply_result = 'PASS';
