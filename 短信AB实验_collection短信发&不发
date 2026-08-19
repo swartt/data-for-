@@ -1,0 +1,252 @@
+WITH ab_node AS (
+
+    SELECT
+        plan_id,
+        phone,
+        start_time,
+
+        JSON_UNQUOTE(
+            JSON_EXTRACT(
+                output_param,
+                '$.name'
+            )
+        ) AS ab_group,
+
+        ROW_NUMBER() OVER(
+            PARTITION BY plan_id, phone
+            ORDER BY start_time
+        ) AS rn
+
+    FROM ug_analysis_dw_prod.ods_mtn_process_business_node
+
+    WHERE plan_id IN
+    (
+        '2962',
+        '2963',
+        '2964',
+        '2965',
+        '2966',
+        '2967',
+        '2968',
+        '2969'
+    )
+
+    AND element_type = 'AB_TEST'
+
+    AND start_time >= '2026-06-28 00:00:00'
+    AND start_time <  '2026-08-12 00:00:00'
+
+    AND JSON_UNQUOTE(
+            JSON_EXTRACT(
+                output_param,
+                '$.name'
+            )
+        ) IN ('A', 'B', 'C')
+),
+
+
+ab_base AS (
+
+    SELECT
+        plan_id,
+        phone,
+        start_time,
+        ab_group
+
+    FROM ab_node
+
+    WHERE rn = 1
+),
+
+
+sms_success AS (
+
+    SELECT
+        plan_id,
+        phone,
+
+        MIN(send_time) AS send_time
+
+    FROM ug_analysis_dw_prod.ods_mtn_t_message_record_rt
+
+    WHERE plan_id IN
+    (
+        '2962',
+        '2963',
+        '2964',
+        '2965',
+        '2966',
+        '2967',
+        '2968',
+        '2969'
+    )
+
+    AND send_success = 1
+
+    AND send_time >= '2026-06-28 00:00:00'
+    AND send_time <  '2026-08-12 00:00:00'
+
+    GROUP BY
+        plan_id,
+        phone
+),
+
+
+experiment_user AS (
+
+    SELECT
+        a.plan_id,
+        a.phone,
+        a.ab_group,
+
+        COALESCE(s.send_time, a.start_time) AS event_time
+
+    FROM ab_base a
+
+    LEFT JOIN sms_success s
+        ON a.plan_id = s.plan_id
+       AND a.phone = s.phone
+
+    WHERE
+        (
+            a.ab_group IN ('A', 'B')
+            AND s.phone IS NOT NULL
+        )
+        OR
+        (
+            a.ab_group = 'C'
+        )
+),
+
+
+customer_map AS (
+
+    SELECT
+        phone,
+        id AS customer_id,
+
+        ROW_NUMBER() OVER(
+            PARTITION BY phone
+            ORDER BY create_time, id
+        ) AS rn
+
+    FROM ug_analysis_dw_prod.ods_mtn_b_customer
+),
+
+
+experiment_customer AS (
+
+    SELECT
+        e.plan_id,
+        e.ab_group,
+        e.phone,
+        e.event_time,
+        c.customer_id
+
+    FROM experiment_user e
+
+    INNER JOIN customer_map c
+        ON e.phone = c.phone
+       AND c.rn = 1
+),
+
+
+repay_detail AS (
+
+    SELECT
+        e.plan_id,
+        e.ab_group,
+        e.phone,
+        t.transaction_time
+
+    FROM experiment_customer e
+
+    INNER JOIN ug_analysis_dw_prod.ods_mtn_b_trans_record t
+        ON e.customer_id = t.customer_id
+       AND t.transaction_type = 'REPAY'
+       AND t.transaction_time >= e.event_time
+       AND t.transaction_time <
+           DATE_ADD(
+               e.event_time,
+               INTERVAL 48 HOUR
+           )
+),
+
+
+group_result AS (
+
+    SELECT
+        e.plan_id,
+        e.ab_group,
+
+        COUNT(DISTINCT e.phone)
+            AS sms_user_cnt,
+
+        COUNT(
+            DISTINCT IF(
+                r.transaction_time <
+                    DATE_ADD(e.event_time, INTERVAL 24 HOUR),
+                e.phone,
+                NULL
+            )
+        ) AS repay_user_24h,
+
+        COUNT(
+            DISTINCT IF(
+                r.transaction_time <
+                    DATE_ADD(e.event_time, INTERVAL 48 HOUR),
+                e.phone,
+                NULL
+            )
+        ) AS repay_user_48h
+
+    FROM experiment_customer e
+
+    LEFT JOIN repay_detail r
+        ON e.plan_id = r.plan_id
+       AND e.ab_group = r.ab_group
+       AND e.phone = r.phone
+
+    GROUP BY
+        e.plan_id,
+        e.ab_group
+)
+
+
+SELECT
+
+    plan_id AS `plan_id`,
+
+    ab_group AS `AB组`,
+
+    sms_user_cnt AS `触达用户数`,
+
+    repay_user_24h AS `24H回款用户数`,
+
+    CONCAT(
+        ROUND(
+            repay_user_24h * 100.0
+            /
+            NULLIF(sms_user_cnt, 0),
+            2
+        ),
+        '%'
+    ) AS `24H回款率`,
+
+    repay_user_48h AS `48H回款用户数`,
+
+    CONCAT(
+        ROUND(
+            repay_user_48h * 100.0
+            /
+            NULLIF(sms_user_cnt, 0),
+            2
+        ),
+        '%'
+    ) AS `48H回款率`
+
+FROM group_result
+
+ORDER BY
+    plan_id,
+    ab_group;
