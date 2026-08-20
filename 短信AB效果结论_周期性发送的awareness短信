@@ -1,0 +1,785 @@
+WITH ab_raw AS (
+
+    /* ========================================================
+       1. 2953~2955 A/B实验节点
+
+       2953/2954：
+       2026-06-28以后每天
+
+       2955：
+       2026-06-05以后每周三
+
+       A = 发短信
+       B = 不发短信
+       ======================================================== */
+
+    SELECT
+        t.plan_id,
+        t.phone,
+        t.start_time,
+
+        GET_JSON_STRING(
+            t.output_param,
+            '$.name'
+        ) AS ab_group,
+
+        ROW_NUMBER() OVER (
+            PARTITION BY
+                t.plan_id,
+                t.phone,
+                DATE(t.start_time)
+            ORDER BY t.start_time
+        ) AS rn
+
+    FROM ug_analysis_dw_prod.ods_mtn_process_business_node t
+
+    WHERE t.plan_id IN ('2953', '2954', '2955')
+
+      AND t.element_type = 'AB_TEST'
+
+      AND GET_JSON_STRING(
+            t.output_param,
+            '$.name'
+          ) IN ('A', 'B')
+
+      AND (
+            (
+                t.plan_id IN ('2953', '2954')
+                AND DATE(t.start_time) >= '2026-06-28'
+                AND DATE(t.start_time) <= CURDATE()
+            )
+
+            OR
+
+            (
+                t.plan_id = '2955'
+                AND DATE(t.start_time) >= '2026-06-05'
+                AND DATE(t.start_time) <= CURDATE()
+
+                /* MySQL/Doris DAYOFWEEK:
+                   周日=1，周一=2，周二=3，周三=4 */
+                AND DAYOFWEEK(DATE(t.start_time)) = 4
+            )
+      )
+),
+
+
+ab_base AS (
+
+    /* ========================================================
+       2. 同一个用户 × plan × 日期
+          只保留一次实验记录
+       ======================================================== */
+
+    SELECT
+        plan_id,
+        phone,
+        start_time,
+        ab_group
+
+    FROM ab_raw
+
+    WHERE rn = 1
+),
+
+
+sms_success AS (
+
+    /* ========================================================
+       3. A组真实短信成功发送记录
+
+       每个用户 × plan × 日期
+       只保留第一次成功发送时间
+
+       B组不发短信，所以不会使用此表作为过滤条件
+       ======================================================== */
+
+    SELECT
+        m.plan_id,
+        m.phone,
+        DATE(m.send_time) AS send_date,
+
+        MIN(m.send_time) AS first_send_time
+
+    FROM ug_analysis_dw_prod.ods_mtn_t_message_record_rt m
+
+    WHERE m.plan_id IN ('2953', '2954', '2955')
+
+      AND m.send_success = 1
+
+      AND DATE(m.send_time) >= '2026-06-05'
+      AND DATE(m.send_time) <= CURDATE()
+
+    GROUP BY
+        m.plan_id,
+        m.phone,
+        DATE(m.send_time)
+),
+
+
+experiment_base AS (
+
+    /* ========================================================
+       4. 构造真正实验母群
+
+       A：
+       必须成功发送短信
+
+       B：
+       不发短信，因此直接保留
+
+       注意：
+       A/B统一用 start_time 作为T0，
+       不使用send_time作为观察窗口起点。
+       ======================================================== */
+
+    SELECT
+        a.plan_id,
+        a.phone,
+        a.start_time,
+        DATE(a.start_time) AS experiment_date,
+        a.ab_group,
+
+        s.first_send_time
+
+    FROM ab_base a
+
+    LEFT JOIN sms_success s
+        ON a.plan_id = s.plan_id
+       AND a.phone = s.phone
+       AND DATE(a.start_time) = s.send_date
+
+    WHERE
+        (
+            a.ab_group = 'A'
+            AND s.phone IS NOT NULL
+        )
+
+        OR
+
+        (
+            a.ab_group = 'B'
+        )
+),
+
+
+first_optin AS (
+
+    /* ========================================================
+       5. 首次成功Opt-in
+
+       当前业务定义：
+       credit_apply.apply_result = 'PASS'
+
+       每个手机号取首次PASS时间
+       ======================================================== */
+
+    SELECT
+        phone,
+
+        MIN(create_time) AS first_optin_time
+
+    FROM ug_analysis_dw_prod.ods_mtn_b_credit_apply
+
+    WHERE apply_result = 'PASS'
+
+    GROUP BY phone
+),
+
+
+phone_customer AS (
+
+    /* ========================================================
+       6. phone → trans_record customer_id
+
+       business_node和trans_record的customer_id体系不同，
+       因此经由b_customer做映射。
+
+       不强制只取一个customer_id：
+       同一个phone历史上如果对应多个customer_id，
+       全部用于检查历史LEND。
+       ======================================================== */
+
+    SELECT DISTINCT
+        phone,
+        id AS customer_id
+
+    FROM ug_analysis_dw_prod.ods_mtn_b_customer
+),
+
+
+first_lend_after_optin AS (
+
+    /* ========================================================
+       7. 找每个成功Opt-in用户之后的第一次LEND
+
+       这样可以判断：
+
+       first_optin
+          ↓
+       是否在营销start_time之前已经用信
+
+       同时也能直接判断营销后24H/48H是否首次用信。
+       ======================================================== */
+
+    SELECT
+        o.phone,
+
+        MIN(t.transaction_time) AS first_lend_time
+
+    FROM first_optin o
+
+    JOIN phone_customer c
+        ON o.phone = c.phone
+
+    JOIN ug_analysis_dw_prod.ods_mtn_b_trans_record t
+        ON c.customer_id = t.customer_id
+       AND t.transaction_type = 'LEND'
+       AND t.transaction_time >= o.first_optin_time
+
+    GROUP BY o.phone
+),
+
+
+target_event AS (
+
+    /* ========================================================
+       8. 正式短信目标人群
+
+       必须满足：
+       ① 已成功Opt-in
+       ② 首次Opt-in发生在本次营销start_time之前
+       ③ 从首次Opt-in到本次start_time之前从未LEND
+
+       注意：
+       这批人定义为：
+       “Opt-in成功未用信用户”
+
+       不是 Eligible Non-Adopter。
+       ======================================================== */
+
+    SELECT
+        e.plan_id,
+        e.phone,
+        e.start_time,
+        e.experiment_date,
+        e.ab_group,
+        e.first_send_time,
+
+        o.first_optin_time,
+
+        l.first_lend_time,
+
+        CONCAT(
+            e.plan_id,
+            '_',
+            e.phone,
+            '_',
+            CAST(e.start_time AS STRING)
+        ) AS event_id
+
+    FROM experiment_base e
+
+    JOIN first_optin o
+        ON e.phone = o.phone
+       AND o.first_optin_time <= e.start_time
+
+    LEFT JOIN first_lend_after_optin l
+        ON e.phone = l.phone
+
+    WHERE
+        l.first_lend_time IS NULL
+
+        OR
+
+        l.first_lend_time >= e.start_time
+),
+
+
+event_flag AS (
+
+    /* ========================================================
+       9. 每次实验事件计算24H/48H结果
+
+       24H：
+       [start_time, start_time + 24H)
+
+       48H：
+       [start_time, start_time + 48H)
+
+       mature_24h / mature_48h：
+       防止最新批次还没观察满就进入分母
+       ======================================================== */
+
+    SELECT
+        plan_id,
+        phone,
+        start_time,
+        experiment_date,
+        ab_group,
+        event_id,
+
+        CASE
+            WHEN start_time <= DATE_SUB(
+                NOW(),
+                INTERVAL 24 HOUR
+            )
+            THEN 1
+            ELSE 0
+        END AS mature_24h,
+
+        CASE
+            WHEN start_time <= DATE_SUB(
+                NOW(),
+                INTERVAL 48 HOUR
+            )
+            THEN 1
+            ELSE 0
+        END AS mature_48h,
+
+        CASE
+            WHEN first_lend_time >= start_time
+             AND first_lend_time < DATE_ADD(
+                    start_time,
+                    INTERVAL 24 HOUR
+                 )
+            THEN 1
+            ELSE 0
+        END AS lend_24h_flag,
+
+        CASE
+            WHEN first_lend_time >= start_time
+             AND first_lend_time < DATE_ADD(
+                    start_time,
+                    INTERVAL 48 HOUR
+                 )
+            THEN 1
+            ELSE 0
+        END AS lend_48h_flag
+
+    FROM target_event
+),
+
+
+/* ============================================================
+   10. 每日结果
+   ============================================================ */
+
+daily_metrics AS (
+
+    SELECT
+        plan_id,
+        experiment_date,
+        ab_group,
+
+        /* 24H成熟用户 */
+        COUNT(
+            DISTINCT CASE
+                WHEN mature_24h = 1
+                THEN phone
+            END
+        ) AS mature_user_24h,
+
+        /* 24H LEND用户 */
+        COUNT(
+            DISTINCT CASE
+                WHEN mature_24h = 1
+                 AND lend_24h_flag = 1
+                THEN phone
+            END
+        ) AS lend_user_24h,
+
+        /* 48H成熟用户 */
+        COUNT(
+            DISTINCT CASE
+                WHEN mature_48h = 1
+                THEN phone
+            END
+        ) AS mature_user_48h,
+
+        /* 48H LEND用户 */
+        COUNT(
+            DISTINCT CASE
+                WHEN mature_48h = 1
+                 AND lend_48h_flag = 1
+                THEN phone
+            END
+        ) AS lend_user_48h
+
+    FROM event_flag
+
+    GROUP BY
+        plan_id,
+        experiment_date,
+        ab_group
+),
+
+
+daily_result AS (
+
+    SELECT
+        plan_id,
+        experiment_date,
+        ab_group,
+
+        mature_user_24h,
+        lend_user_24h,
+
+        lend_user_24h * 1.0
+        /
+        NULLIF(
+            mature_user_24h,
+            0
+        ) AS lend_rate_24h,
+
+        mature_user_48h,
+        lend_user_48h,
+
+        lend_user_48h * 1.0
+        /
+        NULLIF(
+            mature_user_48h,
+            0
+        ) AS lend_rate_48h
+
+    FROM daily_metrics
+),
+
+
+daily_control AS (
+
+    SELECT
+        plan_id,
+        experiment_date,
+
+        lend_rate_24h AS b_rate_24h,
+        lend_rate_48h AS b_rate_48h
+
+    FROM daily_result
+
+    WHERE ab_group = 'B'
+),
+
+
+/* ============================================================
+   11. Plan全周期汇总
+
+   注意：
+   仍然严格限制每次实验自己的24H/48H窗口。
+
+   不是统计“全周期任意时间发生LEND”。
+   ============================================================ */
+
+plan_metrics AS (
+
+    SELECT
+        plan_id,
+        ab_group,
+
+        /* 24H完整成熟去重用户 */
+        COUNT(
+            DISTINCT CASE
+                WHEN mature_24h = 1
+                THEN phone
+            END
+        ) AS mature_user_24h,
+
+        COUNT(
+            DISTINCT CASE
+                WHEN mature_24h = 1
+                 AND lend_24h_flag = 1
+                THEN phone
+            END
+        ) AS lend_user_24h,
+
+        /* 48H完整成熟去重用户 */
+        COUNT(
+            DISTINCT CASE
+                WHEN mature_48h = 1
+                THEN phone
+            END
+        ) AS mature_user_48h,
+
+        COUNT(
+            DISTINCT CASE
+                WHEN mature_48h = 1
+                 AND lend_48h_flag = 1
+                THEN phone
+            END
+        ) AS lend_user_48h
+
+    FROM event_flag
+
+    GROUP BY
+        plan_id,
+        ab_group
+),
+
+
+plan_result AS (
+
+    SELECT
+        plan_id,
+        ab_group,
+
+        mature_user_24h,
+        lend_user_24h,
+
+        lend_user_24h * 1.0
+        /
+        NULLIF(
+            mature_user_24h,
+            0
+        ) AS lend_rate_24h,
+
+        mature_user_48h,
+        lend_user_48h,
+
+        lend_user_48h * 1.0
+        /
+        NULLIF(
+            mature_user_48h,
+            0
+        ) AS lend_rate_48h
+
+    FROM plan_metrics
+),
+
+
+plan_control AS (
+
+    SELECT
+        plan_id,
+
+        lend_rate_24h AS b_rate_24h,
+        lend_rate_48h AS b_rate_48h
+
+    FROM plan_result
+
+    WHERE ab_group = 'B'
+)
+
+
+/* ============================================================
+   12. 最终同时输出：
+       DAILY + PLAN_TOTAL
+   ============================================================ */
+
+SELECT
+    'DAILY' AS `统计层级`,
+
+    d.plan_id AS `plan_id`,
+
+    d.experiment_date AS `实验日期`,
+
+    d.ab_group AS `AB组`,
+
+    d.mature_user_24h AS `24H成熟实验用户数`,
+
+    d.lend_user_24h AS `24H_LEND用户数`,
+
+    CONCAT(
+        ROUND(
+            d.lend_rate_24h * 100,
+            2
+        ),
+        '%'
+    ) AS `24H_LEND率`,
+
+    d.mature_user_48h AS `48H成熟实验用户数`,
+
+    d.lend_user_48h AS `48H_LEND用户数`,
+
+    CONCAT(
+        ROUND(
+            d.lend_rate_48h * 100,
+            2
+        ),
+        '%'
+    ) AS `48H_LEND率`,
+
+    CASE
+        WHEN d.ab_group = 'A'
+        THEN CONCAT(
+            ROUND(
+                (
+                    d.lend_rate_24h
+                    -
+                    c.b_rate_24h
+                ) * 100,
+                2
+            ),
+            'pp'
+        )
+        ELSE NULL
+    END AS `24H_vs_B提升`,
+
+    CASE
+        WHEN d.ab_group = 'A'
+        THEN CONCAT(
+            ROUND(
+                (
+                    d.lend_rate_24h
+                    /
+                    NULLIF(c.b_rate_24h, 0)
+                    - 1
+                ) * 100,
+                2
+            ),
+            '%'
+        )
+        ELSE NULL
+    END AS `24H_vs_B_Lift`,
+
+    CASE
+        WHEN d.ab_group = 'A'
+        THEN CONCAT(
+            ROUND(
+                (
+                    d.lend_rate_48h
+                    -
+                    c.b_rate_48h
+                ) * 100,
+                2
+            ),
+            'pp'
+        )
+        ELSE NULL
+    END AS `48H_vs_B提升`,
+
+    CASE
+        WHEN d.ab_group = 'A'
+        THEN CONCAT(
+            ROUND(
+                (
+                    d.lend_rate_48h
+                    /
+                    NULLIF(c.b_rate_48h, 0)
+                    - 1
+                ) * 100,
+                2
+            ),
+            '%'
+        )
+        ELSE NULL
+    END AS `48H_vs_B_Lift`
+
+FROM daily_result d
+
+LEFT JOIN daily_control c
+    ON d.plan_id = c.plan_id
+   AND d.experiment_date = c.experiment_date
+
+
+UNION ALL
+
+
+SELECT
+    'PLAN_TOTAL' AS `统计层级`,
+
+    p.plan_id AS `plan_id`,
+
+    NULL AS `实验日期`,
+
+    p.ab_group AS `AB组`,
+
+    p.mature_user_24h AS `24H成熟实验用户数`,
+
+    p.lend_user_24h AS `24H_LEND用户数`,
+
+    CONCAT(
+        ROUND(
+            p.lend_rate_24h * 100,
+            2
+        ),
+        '%'
+    ) AS `24H_LEND率`,
+
+    p.mature_user_48h AS `48H成熟实验用户数`,
+
+    p.lend_user_48h AS `48H_LEND用户数`,
+
+    CONCAT(
+        ROUND(
+            p.lend_rate_48h * 100,
+            2
+        ),
+        '%'
+    ) AS `48H_LEND率`,
+
+    CASE
+        WHEN p.ab_group = 'A'
+        THEN CONCAT(
+            ROUND(
+                (
+                    p.lend_rate_24h
+                    -
+                    c.b_rate_24h
+                ) * 100,
+                2
+            ),
+            'pp'
+        )
+        ELSE NULL
+    END AS `24H_vs_B提升`,
+
+    CASE
+        WHEN p.ab_group = 'A'
+        THEN CONCAT(
+            ROUND(
+                (
+                    p.lend_rate_24h
+                    /
+                    NULLIF(c.b_rate_24h, 0)
+                    - 1
+                ) * 100,
+                2
+            ),
+            '%'
+        )
+        ELSE NULL
+    END AS `24H_vs_B_Lift`,
+
+    CASE
+        WHEN p.ab_group = 'A'
+        THEN CONCAT(
+            ROUND(
+                (
+                    p.lend_rate_48h
+                    -
+                    c.b_rate_48h
+                ) * 100,
+                2
+            ),
+            'pp'
+        )
+        ELSE NULL
+    END AS `48H_vs_B提升`,
+
+    CASE
+        WHEN p.ab_group = 'A'
+        THEN CONCAT(
+            ROUND(
+                (
+                    p.lend_rate_48h
+                    /
+                    NULLIF(c.b_rate_48h, 0)
+                    - 1
+                ) * 100,
+                2
+            ),
+            '%'
+        )
+        ELSE NULL
+    END AS `48H_vs_B_Lift`
+
+FROM plan_result p
+
+LEFT JOIN plan_control c
+    ON p.plan_id = c.plan_id
+
+ORDER BY
+    `plan_id`,
+    `统计层级`,
+    `实验日期`,
+    `AB组`;
