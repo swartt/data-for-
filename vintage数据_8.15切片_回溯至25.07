@@ -1,0 +1,263 @@
+SELECT
+    DATE_FORMAT(disburse_dt, '%Y-%m') AS vintage_month,
+
+    /* 总放款金额 */
+    SUM(disburse_principal) AS total_disbursed_amount,
+
+    /* T0 / Day0 */
+    SUM(bal_0) AS bal_0,
+    ROUND(
+        SUM(bal_0)
+        /
+        NULLIF(
+            SUM(disburse_principal),
+            0
+        ),
+        4
+    ) AS day_0_pct,
+
+    /* Day1 */
+    SUM(bal_1) AS bal_1,
+    ROUND(
+        SUM(bal_1)
+        /
+        NULLIF(
+            SUM(
+                CASE
+                    WHEN bal_1 IS NOT NULL
+                    THEN disburse_principal
+                END
+            ),
+            0
+        ),
+        4
+    ) AS day_1_pct,
+
+    /* Day2 */
+    SUM(bal_2) AS bal_2,
+    ROUND(
+        SUM(bal_2)
+        /
+        NULLIF(
+            SUM(
+                CASE
+                    WHEN bal_2 IS NOT NULL
+                    THEN disburse_principal
+                END
+            ),
+            0
+        ),
+        4
+    ) AS day_2_pct,
+
+    /* Day3 */
+    SUM(bal_3) AS bal_3,
+    ROUND(
+        SUM(bal_3)
+        /
+        NULLIF(
+            SUM(
+                CASE
+                    WHEN bal_3 IS NOT NULL
+                    THEN disburse_principal
+                END
+            ),
+            0
+        ),
+        4
+    ) AS day_3_pct,
+
+    /* Day7 */
+    SUM(bal_7) AS bal_7,
+    ROUND(
+        SUM(bal_7)
+        /
+        NULLIF(
+            SUM(
+                CASE
+                    WHEN bal_7 IS NOT NULL
+                    THEN disburse_principal
+                END
+            ),
+            0
+        ),
+        4
+    ) AS day_7_pct,
+
+    /* Day14 */
+    SUM(bal_14) AS bal_14,
+    ROUND(
+        SUM(bal_14)
+        /
+        NULLIF(
+            SUM(
+                CASE
+                    WHEN bal_14 IS NOT NULL
+                    THEN disburse_principal
+                END
+            ),
+            0
+        ),
+        4
+    ) AS day_14_pct,
+
+    /* Day21 */
+    SUM(bal_21) AS bal_21,
+    ROUND(
+        SUM(bal_21)
+        /
+        NULLIF(
+            SUM(
+                CASE
+                    WHEN bal_21 IS NOT NULL
+                    THEN disburse_principal
+                END
+            ),
+            0
+        ),
+        4
+    ) AS day_21_pct,
+
+    /* Day30 */
+    SUM(bal_30) AS bal_30,
+    ROUND(
+        SUM(bal_30)
+        /
+        NULLIF(
+            SUM(
+                CASE
+                    WHEN bal_30 IS NOT NULL
+                    THEN disburse_principal
+                END
+            ),
+            0
+        ),
+        4
+    ) AS day_30_pct,
+
+    /* Day45 */
+    SUM(bal_45) AS bal_45,
+    ROUND(
+        SUM(bal_45)
+        /
+        NULLIF(
+            SUM(
+                CASE
+                    WHEN bal_45 IS NOT NULL
+                    THEN disburse_principal
+                END
+            ),
+            0
+        ),
+        4
+    ) AS day_45_pct,
+
+    /* Day60 */
+    SUM(bal_60) AS bal_60,
+    ROUND(
+        SUM(bal_60)
+        /
+        NULLIF(
+            SUM(
+                CASE
+                    WHEN bal_60 IS NOT NULL
+                    THEN disburse_principal
+                END
+            ),
+            0
+        ),
+        4
+    ) AS day_60_pct,
+
+    /* Day90 */
+    SUM(bal_90) AS bal_90,
+    ROUND(
+        SUM(bal_90)
+        /
+        NULLIF(
+            SUM(
+                CASE
+                    WHEN bal_90 IS NOT NULL
+                    THEN disburse_principal
+                END
+            ),
+            0
+        ),
+        4
+    ) AS day_90_pct,
+
+    /* Day120 */
+    SUM(bal_120) AS bal_120,
+    ROUND(
+        SUM(bal_120)
+        /
+        NULLIF(
+            SUM(
+                CASE
+                    WHEN bal_120 IS NOT NULL
+                    THEN disburse_principal
+                END
+            ),
+            0
+        ),
+        4
+    ) AS day_120_pct,
+
+    /* Day150 */
+    SUM(bal_150) AS bal_150,
+    ROUND(
+        SUM(bal_150)
+        /
+        NULLIF(
+            SUM(
+                CASE
+                    WHEN bal_150 IS NOT NULL
+                    THEN disburse_principal
+                END
+            ),
+            0
+        ),
+        4
+    ) AS day_150_pct,
+
+    /* Day180 */
+    SUM(bal_180) AS bal_180,
+    ROUND(
+        SUM(bal_180)
+        /
+        NULLIF(
+            SUM(
+                CASE
+                    WHEN bal_180 IS NOT NULL
+                    THEN disburse_principal
+                END
+            ),
+            0
+        ),
+        4
+    ) AS day_180_pct,
+
+    /* Day210 */
+    SUM(bal_210) AS bal_210,
+    ROUND(
+        SUM(bal_210)
+        /
+        NULLIF(
+            SUM(
+                CASE
+                    WHEN bal_210 IS NOT NULL
+                    THEN disburse_principal
+                END
+            ),
+            0
+        ),
+        4
+    ) AS day_210_pct
+
+FROM ug_analysis_dw_prod.ads_mtn_eod_vintage_result_df
+
+WHERE dt = '2026-08-15'
+
+GROUP BY DATE_FORMAT(disburse_dt, '%Y-%m')
+
+ORDER BY vintage_month;
