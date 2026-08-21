@@ -1,0 +1,444 @@
+WITH node_group AS (
+
+    /*
+    =========================================
+    1. 获取3183 AB Test分组
+    =========================================
+    */
+
+    SELECT
+
+        plan_id,
+
+        phone,
+
+        start_time,
+
+
+        GET_JSON_STRING(
+            output_param,
+            '$.name'
+        ) AS ab_group,
+
+
+        ROW_NUMBER() OVER(
+            PARTITION BY
+                plan_id,
+                phone
+
+            ORDER BY
+                start_time
+        ) AS rn
+
+
+    FROM ug_analysis_dw_prod.ods_mtn_process_business_node
+
+
+    WHERE plan_id='3183'
+
+
+      AND element_type='AB_TEST'
+
+
+      AND DATE(start_time)
+          = DATE_SUB(CURDATE(),INTERVAL 1 DAY)
+
+
+      AND GET_JSON_STRING(
+            output_param,
+            '$.name'
+          )
+          IN ('A','B','C','D','E')
+
+),
+
+
+
+base AS (
+
+    SELECT
+
+        plan_id,
+
+        phone,
+
+        start_time,
+
+        ab_group
+
+
+    FROM node_group
+
+    WHERE rn=1
+
+),
+
+
+
+/*
+=================================================
+2. 获取短信DELIVER结果
+A/B/C/D
+=================================================
+*/
+
+
+sms_detail AS (
+
+    SELECT
+
+
+        b.plan_id,
+
+        b.phone,
+
+        b.ab_group,
+
+
+        MIN(
+            CASE
+                WHEN GET_JSON_STRING(
+                    m.notify_message,
+                    '$.finalStatus'
+                )='DELIVRD'
+
+                THEN m.send_time
+
+            END
+        ) AS delivered_time
+
+
+
+    FROM base b
+
+
+    LEFT JOIN ug_analysis_dw_prod.ods_mtn_t_message_record_rt m
+
+
+        ON b.plan_id=m.plan_id
+
+       AND b.phone=m.phone
+
+
+
+    GROUP BY
+
+
+        b.plan_id,
+
+        b.phone,
+
+        b.ab_group
+
+),
+
+
+
+/*
+=================================================
+3. 构建10H转化用户池
+
+A/B/C/D:
+DELIVRD用户
+
+E:
+全部用户
+
+=================================================
+*/
+
+
+conversion_base AS (
+
+    SELECT
+
+
+        plan_id,
+
+        phone,
+
+        ab_group,
+
+        delivered_time AS event_time
+
+
+
+    FROM sms_detail
+
+
+    WHERE ab_group IN ('A','B','C','D')
+
+      AND delivered_time IS NOT NULL
+
+
+
+    UNION ALL
+
+
+
+    SELECT
+
+
+        plan_id,
+
+        phone,
+
+        ab_group,
+
+        start_time AS event_time
+
+
+
+    FROM base
+
+
+    WHERE ab_group='E'
+
+),
+
+
+
+/*
+=================================================
+4. 10H LEND用户
+=================================================
+*/
+
+
+lend_detail AS (
+
+    SELECT DISTINCT
+
+
+        c.plan_id,
+
+        c.phone,
+
+        c.ab_group
+
+
+
+    FROM conversion_base c
+
+
+
+    JOIN ug_analysis_dw_prod.ods_mtn_b_customer bc
+
+
+        ON c.phone=bc.phone
+
+
+
+    JOIN ug_analysis_dw_prod.ods_mtn_b_trans_record t
+
+
+        ON bc.id=t.customer_id
+
+
+
+       AND t.transaction_type='LEND'
+
+
+
+       AND t.transaction_time >= c.event_time
+
+
+
+       AND t.transaction_time <
+
+           DATE_ADD(
+               c.event_time,
+               INTERVAL 10 HOUR
+           )
+
+),
+
+
+
+/*
+=================================================
+5. 汇总
+=================================================
+*/
+
+
+result AS (
+
+    SELECT
+
+
+        b.plan_id,
+
+
+        b.ab_group,
+
+
+        COUNT(
+            DISTINCT b.phone
+        ) AS node_user_cnt,
+
+
+        COUNT(
+            DISTINCT CASE
+
+                WHEN s.delivered_time IS NOT NULL
+
+                THEN b.phone
+
+            END
+        ) AS delivered_user_cnt,
+
+
+        COUNT(
+            DISTINCT l.phone
+        ) AS lend_user_10h
+
+
+
+    FROM base b
+
+
+
+    LEFT JOIN sms_detail s
+
+
+        ON b.plan_id=s.plan_id
+
+       AND b.phone=s.phone
+
+
+
+    LEFT JOIN lend_detail l
+
+
+        ON b.plan_id=l.plan_id
+
+       AND b.phone=l.phone
+
+       AND b.ab_group=l.ab_group
+
+
+
+    GROUP BY
+
+
+        b.plan_id,
+
+        b.ab_group
+
+)
+
+
+
+SELECT
+
+
+    plan_id AS `plan_id`,
+
+
+    ab_group AS `AB组`,
+
+
+    node_user_cnt AS `node用户数`,
+
+
+
+    CASE
+
+        WHEN ab_group IN ('A','B','C','D')
+
+        THEN delivered_user_cnt
+
+        ELSE NULL
+
+    END AS `DELIVRD成功用户数`,
+
+
+
+    CASE
+
+        WHEN ab_group IN ('A','B','C','D')
+
+        THEN CONCAT(
+
+            ROUND(
+
+                delivered_user_cnt*100.0
+
+                /
+
+                NULLIF(
+                    node_user_cnt,
+                    0
+                ),
+
+                2
+
+            ),
+
+            '%'
+
+        )
+
+        ELSE NULL
+
+    END AS `短信送达率`,
+
+
+
+    lend_user_10h AS `10H用信用户数`,
+
+
+
+    CONCAT(
+
+        ROUND(
+
+            lend_user_10h*100.0
+
+            /
+
+            NULLIF(
+
+                CASE
+
+                    WHEN ab_group IN ('A','B','C','D')
+
+                    THEN delivered_user_cnt
+
+                    ELSE node_user_cnt
+
+                END,
+
+                0
+
+            ),
+
+            2
+
+        ),
+
+        '%'
+
+    ) AS `10H用信率`
+
+
+
+FROM result
+
+
+ORDER BY
+
+CASE
+
+WHEN ab_group='A' THEN 1
+
+WHEN ab_group='B' THEN 2
+
+WHEN ab_group='C' THEN 3
+
+WHEN ab_group='D' THEN 4
+
+WHEN ab_group='E' THEN 5
+
+END;
