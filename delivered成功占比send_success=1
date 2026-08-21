@@ -1,0 +1,162 @@
+WITH sms_base AS (
+
+    /*
+    ==========================================
+    1. 获取3183所有短信发送记录
+    ==========================================
+    */
+
+    SELECT
+
+        plan_id,
+
+        phone,
+
+        send_time,
+
+        send_success,
+
+
+        GET_JSON_STRING(
+            notify_message,
+            '$.finalStatus'
+        ) AS final_status
+
+
+
+    FROM ug_analysis_dw_prod.ods_mtn_t_message_record_rt
+
+
+    WHERE plan_id='3183'
+
+
+      AND DATE(send_time)
+          = DATE_SUB(
+                CURDATE(),
+                INTERVAL 1 DAY
+            )
+
+),
+
+
+
+sms_user AS (
+
+    /*
+    ==========================================
+    2. 用户级别汇总
+
+    一个用户可能多条短信记录
+
+    ==========================================
+    */
+
+
+    SELECT
+
+
+        plan_id,
+
+
+        phone,
+
+
+        MAX(
+            CASE
+                WHEN send_success=1
+                THEN 1
+                ELSE 0
+            END
+        ) AS send_success_flag,
+
+
+        MAX(
+            CASE
+                WHEN final_status='DELIVRD'
+                THEN 1
+                ELSE 0
+            END
+        ) AS delivered_flag
+
+
+
+    FROM sms_base
+
+
+    GROUP BY
+
+        plan_id,
+
+        phone
+
+)
+
+
+
+SELECT
+
+
+    plan_id AS `plan_id`,
+
+
+    COUNT(
+        DISTINCT CASE
+            WHEN send_success_flag=1
+            THEN phone
+        END
+    ) AS `send_success用户数`,
+
+
+
+    COUNT(
+        DISTINCT CASE
+            WHEN delivered_flag=1
+            THEN phone
+        END
+    ) AS `DELIVRD成功用户数`,
+
+
+
+    CONCAT(
+
+        ROUND(
+
+            COUNT(
+                DISTINCT CASE
+                    WHEN delivered_flag=1
+                    THEN phone
+                END
+            )
+            *100.0
+
+            /
+
+            NULLIF(
+
+                COUNT(
+                    DISTINCT CASE
+                        WHEN send_success_flag=1
+                        THEN phone
+                    END
+                ),
+
+                0
+
+            ),
+
+            2
+
+        ),
+
+        '%'
+
+    ) AS `短信送达率`
+
+
+
+FROM sms_user
+
+
+GROUP BY
+
+    plan_id;
