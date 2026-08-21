@@ -1,0 +1,150 @@
+WITH optin_base AS (
+    SELECT
+        id AS customer_id,
+        phone,
+        create_time AS optin_time,
+        DATE(create_time) AS stat_date,
+        HOUR(create_time) AS optin_hour
+    FROM ug_analysis_dw_prod.ods_mtn_b_customer
+    WHERE DATE(create_time) BETWEEN DATE_SUB(CURDATE(), INTERVAL 2 DAY)
+                                AND CURDATE()
+),
+
+pass_base AS (
+    SELECT DISTINCT
+        o.customer_id,
+        o.stat_date,
+        o.optin_hour,
+        a.overdraft_id
+    FROM optin_base o
+    JOIN ug_analysis_dw_prod.ods_mtn_b_credit_apply a
+        ON o.customer_id = a.customer_id
+       AND a.apply_result = 'PASS'
+       AND a.create_time >= o.optin_time
+),
+
+eligible_base AS (
+    SELECT DISTINCT
+        p.customer_id,
+        p.stat_date,
+        p.optin_hour
+    FROM pass_base p
+    JOIN ug_analysis_dw_prod.ods_mtn_b_customer_quota q
+        ON p.overdraft_id = q.overdraft_id
+       AND q.total_quota_amount > 1
+),
+
+hourly_base AS (
+    SELECT
+        o.stat_date,
+        o.optin_hour,
+
+        COUNT(DISTINCT o.customer_id) AS optin_cnt,
+
+        COUNT(DISTINCT p.customer_id) AS pass_cnt,
+
+        COUNT(DISTINCT e.customer_id) AS eligible_cnt
+
+    FROM optin_base o
+
+    LEFT JOIN pass_base p
+        ON o.customer_id = p.customer_id
+
+    LEFT JOIN eligible_base e
+        ON o.customer_id = e.customer_id
+
+    GROUP BY
+        o.stat_date,
+        o.optin_hour
+)
+
+SELECT
+    CONCAT(
+        LPAD(CAST(optin_hour AS STRING), 2, '0'),
+        ':00-',
+        LPAD(CAST(optin_hour + 1 AS STRING), 2, '0'),
+        ':00'
+    ) AS `小时区间`,
+
+    /* =========================
+       T日
+       ========================= */
+
+    MAX(
+        CASE
+            WHEN stat_date = CURDATE()
+            THEN optin_cnt
+        END
+    ) AS `T_OPT_IN`,
+
+    MAX(
+        CASE
+            WHEN stat_date = CURDATE()
+            THEN pass_cnt
+        END
+    ) AS `T_PASS`,
+
+    MAX(
+        CASE
+            WHEN stat_date = CURDATE()
+            THEN eligible_cnt
+        END
+    ) AS `T_Eligible`,
+
+
+    /* =========================
+       T-1
+       ========================= */
+
+    MAX(
+        CASE
+            WHEN stat_date = DATE_SUB(CURDATE(), INTERVAL 1 DAY)
+            THEN optin_cnt
+        END
+    ) AS `T-1_OPT_IN`,
+
+    MAX(
+        CASE
+            WHEN stat_date = DATE_SUB(CURDATE(), INTERVAL 1 DAY)
+            THEN pass_cnt
+        END
+    ) AS `T-1_PASS`,
+
+    MAX(
+        CASE
+            WHEN stat_date = DATE_SUB(CURDATE(), INTERVAL 1 DAY)
+            THEN eligible_cnt
+        END
+    ) AS `T-1_Eligible`,
+
+
+    /* =========================
+       T-2
+       ========================= */
+
+    MAX(
+        CASE
+            WHEN stat_date = DATE_SUB(CURDATE(), INTERVAL 2 DAY)
+            THEN optin_cnt
+        END
+    ) AS `T-2_OPT_IN`,
+
+    MAX(
+        CASE
+            WHEN stat_date = DATE_SUB(CURDATE(), INTERVAL 2 DAY)
+            THEN pass_cnt
+        END
+    ) AS `T-2_PASS`,
+
+    MAX(
+        CASE
+            WHEN stat_date = DATE_SUB(CURDATE(), INTERVAL 2 DAY)
+            THEN eligible_cnt
+        END
+    ) AS `T-2_Eligible`
+
+FROM hourly_base
+
+GROUP BY optin_hour
+
+ORDER BY optin_hour;
